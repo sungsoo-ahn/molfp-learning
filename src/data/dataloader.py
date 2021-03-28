@@ -68,13 +68,13 @@ class SubBatch(Data):
         if compute_true_target:
             smarts_mol_list = [Chem.MolFromSmarts(sub_smarts) for sub_smarts in batch.sub_smarts]
             smiles_mol_list = [Chem.AllChem.MolFromSmiles(smiles) for smiles in batch.smiles]
-                    
+
             targets = [
                 [smiles_mol.HasSubstructMatch(smarts_mol) for smarts_mol in smarts_mol_list]
-                for smiles_mol in smiles_mol_list            
+                for smiles_mol in smiles_mol_list
             ]
-            batch.targets = torch.LongTensor(targets)
-        
+            batch.targets = torch.FloatTensor(targets)
+
         return batch.contiguous()
 
     @property

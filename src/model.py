@@ -107,6 +107,7 @@ class GNN(torch.nn.Module):
         super(GNN, self).__init__()
         self.num_layers = num_layers
 
+        self.emb_dim = emb_dim
         self.x_embedding1 = torch.nn.Embedding(num_atom_type, emb_dim)
         self.x_embedding2 = torch.nn.Embedding(num_chirality_tag, emb_dim)
 
@@ -126,7 +127,7 @@ class GNN(torch.nn.Module):
             out = self.batch_norms[layer_idx](out)
             if layer_idx < self.num_layers - 1:
                 out = F.relu(out)
-    
+
         out = global_mean_pool(out, batch)
 
         return out
