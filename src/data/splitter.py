@@ -22,12 +22,6 @@ def generate_scaffold(smiles, include_chirality=False):
     return scaffold
 
 
-# # test generate_scaffold
-# s = 'Cc1cc(Oc2nccc(CCC)c2)ccc1'
-# scaffold = generate_scaffold(s)
-# assert scaffold == 'c1ccc(Oc2ccccn2)cc1'
-
-
 def scaffold_split(
     dataset,
     smiles_list,

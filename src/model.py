@@ -1,4 +1,6 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops
 from torch_geometric.nn import (
@@ -8,31 +10,14 @@ from torch_geometric.nn import (
     GlobalAttention,
     Set2Set,
 )
-import torch.nn.functional as F
-from torch_scatter import scatter_add
 from torch_geometric.nn.inits import glorot, zeros
+from torch_scatter import scatter_add
 
-num_atom_type = 120  # including the extra mask tokens
-num_chirality_tag = 3
+NUM_ATOM_TYPES = 120  # including the extra mask tokens
+NUM_CHIRALITY_TAGS = 3
 
-num_bond_type = 6  # including aromatic and self-loop edge, and extra masked tokens
-num_bond_direction = 3
-
-
-class ProjectNet(torch.nn.Module):
-    def __init__(self, rep_dim):
-        super(ProjectNet, self).__init__()
-        self.rep_dim = rep_dim
-        self.proj = torch.nn.Sequential(
-            torch.nn.Linear(self.rep_dim, self.rep_dim),
-            torch.nn.ReLU(),
-            torch.nn.Linear(self.rep_dim, self.rep_dim),
-        )
-
-    def forward(self, x):
-        x_proj = self.proj(x)
-
-        return x_proj
+NUM_BOND_TYPES = 6  # including aromatic and self-loop edge, and extra masked tokens
+NUM_BOND_DIRECTIONS = 3
 
 
 class GINConv(MessagePassing):
@@ -50,16 +35,14 @@ class GINConv(MessagePassing):
     def __init__(self, emb_dim, aggr="add"):
         super(GINConv, self).__init__()
         # multi-layer perceptron
-        self.mlp = torch.nn.Sequential(
-            torch.nn.Linear(emb_dim, 2 * emb_dim),
-            torch.nn.ReLU(),
-            torch.nn.Linear(2 * emb_dim, emb_dim),
+        self.mlp = nn.Sequential(
+            nn.Linear(emb_dim, 2 * emb_dim), nn.ReLU(), nn.Linear(2 * emb_dim, emb_dim),
         )
-        self.edge_embedding1 = torch.nn.Embedding(num_bond_type, emb_dim)
-        self.edge_embedding2 = torch.nn.Embedding(num_bond_direction, emb_dim)
+        self.edge_embedding1 = nn.Embedding(NUM_BOND_TYPES, emb_dim)
+        self.edge_embedding2 = nn.Embedding(NUM_BOND_DIRECTIONS, emb_dim)
 
-        torch.nn.init.xavier_uniform_(self.edge_embedding1.weight.data)
-        torch.nn.init.xavier_uniform_(self.edge_embedding2.weight.data)
+        nn.init.xavier_uniform_(self.edge_embedding1.weight.data)
+        nn.init.xavier_uniform_(self.edge_embedding2.weight.data)
         self.aggr = aggr
 
     def forward(self, x, edge_index, edge_attr):
@@ -86,145 +69,81 @@ class GINConv(MessagePassing):
         return self.mlp(aggr_out)
 
 
-class GNN(torch.nn.Module):
-    """
-
-
-    Args:
-        num_layers (int): the number of GNN layers
-        emb_dim (int): dimensionality of embeddings
-        JK (str): last, concat, max or sum.
-        max_pool_layer (int): the layer from which we use max pool rather than add pool for neighbor aggregation
-        drop_ratio (float): dropout rate
-        gnn_type: gin, gcn, graphsage, gat
-
-    Output:
-        node representations
-
-    """
-
-    def __init__(self, num_layers=5, emb_dim=300, JK="last", drop_ratio=0, gnn_type="gin"):
-        super(GNN, self).__init__()
+class NodeEncoder(nn.Module):
+    def __init__(self, num_layers, emb_dim):
+        super(NodeEncoder, self).__init__()
         self.num_layers = num_layers
 
-        self.emb_dim = emb_dim
-        self.x_embedding1 = torch.nn.Embedding(num_atom_type, emb_dim)
-        self.x_embedding2 = torch.nn.Embedding(num_chirality_tag, emb_dim)
+        self.x_embedding1 = nn.Embedding(NUM_ATOM_TYPES, emb_dim)
+        self.x_embedding2 = nn.Embedding(NUM_CHIRALITY_TAGS, emb_dim)
 
-        torch.nn.init.xavier_uniform_(self.x_embedding1.weight.data)
-        torch.nn.init.xavier_uniform_(self.x_embedding2.weight.data)
+        nn.init.xavier_uniform_(self.x_embedding1.weight.data)
+        nn.init.xavier_uniform_(self.x_embedding2.weight.data)
 
-        self.layers = torch.nn.ModuleList([GINConv(emb_dim, aggr="add") for _ in range(num_layers)])
-        self.batch_norms = torch.nn.ModuleList(
-            [torch.nn.BatchNorm1d(emb_dim) for _ in range(num_layers)]
-            )
+        self.layers = nn.ModuleList([GINConv(emb_dim, aggr="add") for _ in range(num_layers)])
+        self.batch_norms = nn.ModuleList([nn.BatchNorm1d(emb_dim) for _ in range(num_layers - 1)])
 
-    def forward(self, x, edge_index, edge_attr, batch):
+    def forward(self, x, edge_index, edge_attr):
         out = self.x_embedding1(x[:, 0]) + self.x_embedding2(x[:, 1])
 
         for layer_idx in range(self.num_layers):
             out = self.layers[layer_idx](out, edge_index, edge_attr)
-            out = self.batch_norms[layer_idx](out)
             if layer_idx < self.num_layers - 1:
+                out = self.batch_norms[layer_idx](out)
                 out = F.relu(out)
 
+        return out
+
+
+class GraphEncoder(NodeEncoder):
+    def __init__(self, num_layers=5, emb_dim=1024):
+        super(GraphEncoder, self).__init__(num_layers, emb_dim)
+
+    def forward(self, x, edge_index, edge_attr, batch):
+        out = super(GraphEncoder, self).forward(x, edge_index, edge_attr)
         out = global_mean_pool(out, batch)
 
         return out
 
 
-class GNN_graphpred(torch.nn.Module):
-    """
-    Extension of GIN to incorporate edge information by concatenation.
+class SubGraphEncoder(NodeEncoder):
+    def __init__(self, num_layers=5, emb_dim=1024):
+        super(SubGraphEncoder, self).__init__(num_layers-1, emb_dim)
+        self.last_mlp = nn.Linear(emb_dim, 2 * emb_dim)
+        self.last_batch_norm = nn.BatchNorm1d(emb_dim)
 
-    Args:
-        num_layers (int): the number of GNN layers
-        emb_dim (int): dimensionality of embeddings
-        num_tasks (int): number of tasks in multi-task learning scenario
-        drop_ratio (float): dropout rate
-        JK (str): last, concat, max or sum.
-        graph_pooling (str): sum, mean, max, attention, set2set
-        gnn_type: gin, gcn, graphsage, gat
+    def forward(self, x, edge_index, edge_attr, batch):
+        out = super(SubGraphEncoder, self).forward(x, edge_index, edge_attr)
+        out = self.last_batch_norm(out)
+        out = F.relu(out)
+        out = self.last_mlp(out)
+        out = global_mean_pool(out, batch)
+        mu, logvar = torch.chunk(out, 2, dim=1)
+        return mu, logvar
 
-    See https://arxiv.org/abs/1810.00826
-    JK-net: https://arxiv.org/abs/1806.03536
-    """
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return eps * std + mu
 
-    def __init__(
-        self,
-        num_layers,
-        emb_dim,
-        num_tasks,
-        JK="last",
-        drop_ratio=0,
-        graph_pooling="mean",
-        gnn_type="gin",
-    ):
-        super(GNN_graphpred, self).__init__()
-        self.num_layers = num_layers
-        self.drop_ratio = drop_ratio
-        self.JK = JK
-        self.emb_dim = emb_dim
-        self.num_tasks = num_tasks
 
-        if self.num_layers < 2:
-            raise ValueError("Number of GNN layers must be greater than 1.")
+class SubGraphDecoder(nn.Module):
+    def __init__(self, num_layers=5, emb_dim=1024):
+        super(SubGraphDecoder, self).__init__()
+        self.node_encoder = NodeEncoder(num_layers=num_layers, emb_dim=emb_dim)
+        self.projector = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.BatchNorm1d(emb_dim),
+            nn.ReLU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
 
-        self.gnn = GNN(num_layers, emb_dim, JK, drop_ratio, gnn_type=gnn_type)
-
-        # Different kind of graph pooling
-        if graph_pooling == "sum":
-            self.pool = global_add_pool
-        elif graph_pooling == "mean":
-            self.pool = global_mean_pool
-        elif graph_pooling == "max":
-            self.pool = global_max_pool
-        elif graph_pooling == "attention":
-            if self.JK == "concat":
-                self.pool = GlobalAttention(
-                    gate_nn=torch.nn.Linear((self.num_layers + 1) * emb_dim, 1)
-                )
-            else:
-                self.pool = GlobalAttention(gate_nn=torch.nn.Linear(emb_dim, 1))
-        elif graph_pooling[:-1] == "set2set":
-            set2set_iter = int(graph_pooling[-1])
-            if self.JK == "concat":
-                self.pool = Set2Set((self.num_layers + 1) * emb_dim, set2set_iter)
-            else:
-                self.pool = Set2Set(emb_dim, set2set_iter)
-        else:
-            raise ValueError("Invalid graph pooling type.")
-
-        # For graph-level binary classification
-        if graph_pooling[:-1] == "set2set":
-            self.mult = 2
-        else:
-            self.mult = 1
-
-        if self.JK == "concat":
-            self.graph_pred_linear = torch.nn.Linear(
-                self.mult * (self.num_layers + 1) * self.emb_dim, self.num_tasks
-            )
-        else:
-            self.graph_pred_linear = torch.nn.Linear(self.mult * self.emb_dim, self.num_tasks)
-
-    def from_pretrained(self, model_file):
-        # self.gnn = GNN(self.num_layers, self.emb_dim, JK = self.JK, drop_ratio = self.drop_ratio)
-        self.gnn.load_state_dict(torch.load(model_file))
-
-    def forward(self, *argv):
-        if len(argv) == 4:
-            x, edge_index, edge_attr, batch = argv[0], argv[1], argv[2], argv[3]
-        elif len(argv) == 1:
-            data = argv[0]
-            x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
-        else:
-            raise ValueError("unmatched number of arguments.")
-
-        node_rep = self.gnn(x, edge_index, edge_attr)
-
-        return self.graph_pred_linear(self.pool(node_rep, batch))
-
+    def forward(self, z, x, edge_index, edge_attr, batch_num_nodes):
+        out0 = self.node_encoder(x, edge_index, edge_attr)
+        out1 = self.projector(z)
+        out1 = torch.repeat_interleave(out1, batch_num_nodes, dim=0)
+        out = F.cosine_similarity(out0, out1, dim=1)
+        return out
 
 if __name__ == "__main__":
     pass

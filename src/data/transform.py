@@ -13,12 +13,12 @@ def reset_idxes(nx_graph):
     nx_graph = nx.relabel_nodes(nx_graph, mapping, copy=True)
     return nx_graph
 
-class AddSubstruct:
+class AddSubStruct:
     def __init__(self, **kwargs):
         pass
     
     def __call__(self, data):
-        subdata = self.sample_subdata(data)
+        subdata, inducing_nodes = self.sample_subdata(data)
         smarts = graph_data_obj_to_smarts(subdata.x, subdata.edge_index, subdata.edge_attr)
 
         data.sub_x = subdata.x
@@ -26,12 +26,15 @@ class AddSubstruct:
         data.sub_edge_index = subdata.edge_index
         data.sub_smarts = smarts
         
+        data.sub_mask = torch.zeros(data.num_nodes)
+        data.sub_mask[inducing_nodes] = 1
+        
         return data
     
     def sample_subdata(self, data):
         raise NotImplementedError
 
-class AddRandomWalkSubstruct(AddSubstruct):
+class AddRandomWalkSubStruct(AddSubStruct):
     def __init__(self, min_walk_length, max_walk_length):
         self.min_walk_length = min_walk_length
         self.max_walk_length = max_walk_length
@@ -43,7 +46,7 @@ class AddRandomWalkSubstruct(AddSubstruct):
         
         randomwalk_nodes = random_walk(
             data.edge_index[0], 
-            data.edge_index[1], 
+            data.edge_index[1],
             torch.tensor([root_node]), 
             walk_length=walk_length
         ).squeeze(0)
@@ -52,4 +55,4 @@ class AddRandomWalkSubstruct(AddSubstruct):
         induced_nx_graph = reset_idxes(induced_nx_graph)
         subdata = nx_to_graph_data_obj_simple(induced_nx_graph)
 
-        return subdata    
+        return subdata, inducing_nodes

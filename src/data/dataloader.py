@@ -1,3 +1,4 @@
+import random
 from rdkit import Chem
 import torch
 from torch.utils.data import DataLoader
@@ -65,15 +66,20 @@ class SubBatch(Data):
         batch.batch_num_nodes = torch.LongTensor(batch.batch_num_nodes)
         batch.sub_batch_num_nodes = torch.LongTensor(batch.sub_batch_num_nodes)
 
-        if compute_true_target:
-            smarts_mol_list = [Chem.MolFromSmarts(sub_smarts) for sub_smarts in batch.sub_smarts]
-            smiles_mol_list = [Chem.AllChem.MolFromSmiles(smiles) for smiles in batch.smiles]
+        # Generate negative samples
+        neg_idxs = [idx for idx in range(batch.batch_size)]
+        random.shuffle(neg_idxs)
+        batch.neg_idxs = torch.LongTensor(neg_idxs)
 
-            targets = [
-                [smiles_mol.HasSubstructMatch(smarts_mol) for smarts_mol in smarts_mol_list]
-                for smiles_mol in smiles_mol_list
-            ]
-            batch.targets = torch.FloatTensor(targets)
+        smarts_mol_list = [Chem.MolFromSmarts(sub_smarts) for sub_smarts in batch.sub_smarts]
+        neg_smiles_list = [batch.smiles[idx] for idx in neg_idxs]
+        neg_smiles_mol_list = [Chem.AllChem.MolFromSmiles(smiles) for smiles in neg_smiles_list]
+
+        neg_targets = [
+            smiles_mol.HasSubstructMatch(smarts_mol)
+            for (smarts_mol, smiles_mol) in zip(smarts_mol_list, neg_smiles_mol_list)
+        ]
+        batch.neg_targets = torch.FloatTensor(neg_targets)
 
         return batch.contiguous()
 
@@ -101,6 +107,6 @@ class SubDataLoader(DataLoader):
             shuffle,
             collate_fn=lambda data_list: SubBatch.from_data_list(
                 data_list, compute_true_target=compute_true_target
-                ),
+            ),
             **kwargs
         )

@@ -6,12 +6,13 @@ import numpy as np
 
 import torch
 import torch.nn.functional as F
+from torch_geometric.nn import global_max_pool
 
-from model import GNN
+from model import GraphEncoder, SubGraphEncoder, SubGraphDecoder
 from data.dataset import MoleculeDataset
 from data.dataloader import SubDataLoader
 from data.splitter import random_split
-from data.transform import AddRandomWalkSubstruct
+from data.transform import AddRandomWalkSubStruct
 
 import neptune
 
@@ -27,17 +28,10 @@ def compute_bce_with_logits_loss(logits, targets):
     return loss
 
 
-def compute_bgce_with_logits_loss(logits, targets, q):
-    logits = logits.reshape(-1)
-    targets = targets.reshape(-1)
-    probs = targets * torch.sigmoid(logits) + (1-targets) * torch.sigmoid(-logits)
-    elemwise_loss = (1 - probs.pow(q)) / q
+def compute_kl_div_loss(mu, log_var):
+    kl_div = torch.mean(-0.5 * torch.mean(1 + log_var - mu ** 2 - log_var.exp(), dim=1), dim=0)
+    return kl_div
 
-    weights = targets / torch.sum(targets) + (1 - targets) / torch.sum(1 - targets)
-    weights /= torch.sum(weights)
-    loss = torch.sum(weights * elemwise_loss)
-
-    return loss
 
 def compute_binary_statistics(logits, targets):
     logits = logits.reshape(-1)
@@ -58,58 +52,128 @@ def compute_binary_statistics(logits, targets):
     }
 
 
-def train(model, sub_model, batch, loss_func, model_optim, sub_model_optim, device):
-    model.train()
-    sub_model.train()
+def train(
+    encoder,
+    sub_encoder,
+    sub_decoder,
+    batch,
+    encoder_optim,
+    sub_encoder_optim,
+    sub_decoder_optim,
+    device,
+):
+    encoder.train()
+    sub_encoder.train()
+    sub_decoder.train()
 
     batch = batch.to(device)
-    targets = torch.eye(batch.batch_size).to(device)
+    substruct_targets = torch.cat([torch.ones_like(batch.neg_targets), batch.neg_targets], dim=0)
 
-    graph_reps = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
-    sub_graph_reps = sub_model(
+    # Compute KL divergence loss
+    sub_graph_mu, sub_graph_logvar = sub_encoder(
         batch.sub_x, batch.sub_edge_index, batch.sub_edge_attr, batch.sub_batch
     )
-    logits = torch.matmul(graph_reps, sub_graph_reps.T) / graph_reps.size(0)
+    sub_graph_reps = sub_encoder.reparameterize(sub_graph_mu, sub_graph_logvar)
+    kl_div_loss = compute_kl_div_loss(sub_graph_mu, sub_graph_logvar)
 
-    loss = loss_func(logits, targets)
+    # Compute recon loss
+    recon_logits = sub_decoder(
+        sub_graph_reps, batch.x, batch.edge_index, batch.edge_attr, batch.batch_num_nodes
+    )
+    recon_loss = compute_bce_with_logits_loss(recon_logits, batch.sub_mask)
 
-    model_optim.zero_grad()
-    sub_model_optim.zero_grad()
+    # Compute BCE loss
+    graph_reps = encoder(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+    neg_graph_reps = graph_reps.index_select(dim=0, index=batch.neg_idxs)
+    graph_and_neg_graph_reps = torch.cat([graph_reps, neg_graph_reps], dim=0)
+    twice_sub_graph_reps = torch.cat([sub_graph_reps, sub_graph_reps], dim=0)
+    substruct_logits = torch.mean(graph_and_neg_graph_reps * twice_sub_graph_reps, dim=1)
+    substruct_loss = compute_bce_with_logits_loss(substruct_logits, substruct_targets)
+
+    # Compute total loss
+    loss = kl_div_loss + recon_loss + substruct_loss
+
+    encoder_optim.zero_grad()
+    sub_encoder_optim.zero_grad()
+    sub_decoder_optim.zero_grad()
     loss.backward()
-    model_optim.step()
-    sub_model_optim.step()
+    encoder_optim.step()
+    sub_encoder_optim.step()
+    sub_decoder_optim.step()
 
     loss = loss.detach()
-    statistics = {"loss": loss}
-    logits = logits.detach()
+    substruct_loss = substruct_loss.detach()
+    kl_div_loss = kl_div_loss.detach()
+    recon_logits = recon_logits.detach()
+    substruct_logits = substruct_logits.detach()
+    statistics = {"loss": loss, "substruct_loss": substruct_loss, "kl_div_loss": kl_div_loss}
 
-    binary_statistics = compute_binary_statistics(logits, targets)
-    statistics.update(binary_statistics)
+    recon_binary_statistics = compute_binary_statistics(recon_logits, batch.sub_mask)
+    for key, val in recon_binary_statistics.items():
+        statistics[f"recon_{key}"] = val
+
+    recon_correct = ((recon_logits > 0) == (batch.sub_mask > 0.5)).float()
+    statistics[f"exact_recon_acc"] = -global_max_pool(-recon_correct, batch.batch).mean()
+
+    substruct_binary_statistics = compute_binary_statistics(substruct_logits, substruct_targets)
+    for key, val in substruct_binary_statistics.items():
+        statistics[f"substruct_{key}"] = val
 
     return statistics
 
 
-def evaluate(model, sub_model, loader, loss_func, device):
-    model.eval()
-    sub_model.eval()
+def evaluate(encoder, sub_encoder, sub_decoder, loader, device):
+    encoder.eval()
+    sub_encoder.eval()
+    sub_decoder.eval()
 
     cum_statistics = defaultdict(float)
     for batch in tqdm(loader):
         batch = batch.to(device)
+        substruct_targets = torch.cat([torch.ones_like(batch.neg_targets), batch.neg_targets], dim=0)
 
-        graph_reps = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
-        sub_graph_reps = sub_model(
+        # Compute KL divergence loss
+        sub_graph_mu, sub_graph_logvar = sub_encoder(
             batch.sub_x, batch.sub_edge_index, batch.sub_edge_attr, batch.sub_batch
         )
-        logits = torch.matmul(graph_reps, sub_graph_reps.T) / graph_reps.size(0)
+        sub_graph_reps = sub_encoder.reparameterize(sub_graph_mu, sub_graph_logvar)
+        kl_div_loss = compute_kl_div_loss(sub_graph_mu, sub_graph_logvar)
 
-        loss = loss_func(logits, batch.targets)
-        binary_statistics = compute_binary_statistics(logits, batch.targets)
+        # Compute recon loss
+        recon_logits = sub_decoder(
+            sub_graph_reps, batch.x, batch.edge_index, batch.edge_attr, batch.batch_num_nodes
+        )
+        recon_loss = compute_bce_with_logits_loss(recon_logits, batch.sub_mask)
 
-        cum_statistics["loss"] += loss
+        # Compute BCE loss
+        graph_reps = encoder(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+        neg_graph_reps = graph_reps.index_select(dim=0, index=batch.neg_idxs)
+        graph_and_neg_graph_reps = torch.cat([graph_reps, neg_graph_reps], dim=0)
+        twice_sub_graph_reps = torch.cat([sub_graph_reps, sub_graph_reps], dim=0)
+        substruct_logits = torch.mean(graph_and_neg_graph_reps * twice_sub_graph_reps, dim=1)
+        substruct_loss = compute_bce_with_logits_loss(substruct_logits, substruct_targets)
+
+        # Compute total loss
+        loss = kl_div_loss + recon_loss + substruct_loss
+
+        # Compute statistics
+        statistics = {"loss": loss, "substruct_loss": substruct_loss, "kl_div_loss": kl_div_loss}
+
+        recon_binary_statistics = compute_binary_statistics(recon_logits, batch.sub_mask)
+        for key, val in recon_binary_statistics.items():
+            statistics[f"recon_{key}"] = val
+
+        recon_correct = ((recon_logits > 0) == (batch.sub_mask > 0.5)).float()
+        statistics[f"exact_recon_acc"] = global_mean_pool(recon_correct, batch.batch).mean()
+
+        substruct_binary_statistics = compute_binary_statistics(substruct_logits, substruct_targets)
+        for key, val in substruct_binary_statistics.items():
+            statistics[f"substruct_{key}"] = val
+
+        for key, val in statistics.items():
+            cum_statistics[key] += val * batch.batch_size
+
         cum_statistics["cnt"] += batch.batch_size
-        for key, val in binary_statistics.items():
-            cum_statistics[key] += binary_statistics[key] * batch.batch_size
 
     cum_cnt = cum_statistics.pop("cnt")
     statistics = {key: val / cum_cnt for key, val in cum_statistics.items()}
@@ -118,18 +182,14 @@ def evaluate(model, sub_model, loader, loss_func, device):
 
 
 def compute_data_statistics(loader):
-    cum_cnt = 0
-    cum_num_nodes = 0
-    cum_num_sub_nodes = 0
-
     cum_statistics = defaultdict(float)
     for batch in loader:
-        unintended_positives = torch.sum(batch.targets.reshape(-1) > 0.5) - batch.batch_size
+        positives = torch.sum(batch.neg_targets.reshape(-1) > 0.5) + batch.batch_size
 
         cum_statistics["cnt"] += batch.batch_size
+        cum_statistics["positive_ratio"] += 0.5 * positives
         cum_statistics["num_nodes"] += batch.x.size(0)
         cum_statistics["num_sub_nodes"] += batch.sub_x.size(0)
-        cum_statistics["unintended_positives"] += unintended_positives
 
     cum_cnt = cum_statistics.pop("cnt")
     statistics = {key: val / cum_cnt for key, val in cum_statistics.items()}
@@ -150,15 +210,13 @@ def main():
     DATASET_DIR = "../resource/dataset/"
     DATASET = "zinc_standard_agent"
     NUM_EPOCHS = 200
-    GCE_Q = 0.7
 
     # Training settings
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--min_walk_length", type=int, default=10)
-    parser.add_argument("--max_walk_length", type=int, default=40)
+    parser.add_argument("--min_walk_length", type=int, default=2)
+    parser.add_argument("--max_walk_length", type=int, default=10)
     parser.add_argument("--loss_scheme", type=str, default="ce")
-    parser.add_argument("--gce_q", type=float, default=0.7)
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -171,7 +229,7 @@ def main():
     dataset = MoleculeDataset(
         DATASET_DIR + DATASET,
         dataset=DATASET,
-        transform=AddRandomWalkSubstruct(
+        transform=AddRandomWalkSubStruct(
             min_walk_length=args.min_walk_length, max_walk_length=args.max_walk_length
         ),
     )
@@ -198,31 +256,22 @@ def main():
         num_workers=NUM_WORKERS,
     )
 
-    # set up model
-    model = GNN().to(device)
-    sub_model = GNN().to(device)
+    # set up encoder
+    encoder = GraphEncoder().to(device)
+    sub_encoder = SubGraphEncoder().to(device)
+    sub_decoder = SubGraphDecoder().to(device)
 
     # set up optimizer
-    model_optim = torch.optim.Adam(model.parameters(), lr=LR)
-    sub_model_optim = torch.optim.Adam(sub_model.parameters(), lr=LR)
-
-    if args.loss_scheme == "ce":
-        loss_func = compute_bce_with_logits_loss
-    elif args.loss_scheme == "gce":
-        loss_func = lambda logits, targets: compute_bgce_with_logits_loss(
-            logits, targets, args.gce_q
-            )
-    else:
-        raise NotImplementedError
+    encoder_optim = torch.optim.Adam(encoder.parameters(), lr=LR)
+    sub_encoder_optim = torch.optim.Adam(sub_encoder.parameters(), lr=LR)
+    sub_decoder_optim = torch.optim.Adam(sub_decoder.parameters(), lr=LR)
 
     neptune.init(project_qualified_name="sungsahn0215/molfp-learning")
     neptune.create_experiment(name="molfp-embed", params=vars(args))
 
-    """
-    data_statistics = compute_data_statistics(vali_loader)
-    for key, val in data_statistics.items():
-        neptune.log_metric(f"data/{key}", val)
-    """
+    #data_statistics = compute_data_statistics(vali_loader)
+    #for key, val in data_statistics.items():
+    #    neptune.log_metric(f"data/{key}", val)
 
     step = 0
     for epoch in range(NUM_EPOCHS):
@@ -230,15 +279,24 @@ def main():
             step += 1
 
             train_statistics = train(
-                model, sub_model, batch, loss_func, model_optim, sub_model_optim, device
-                )
+                encoder,
+                sub_encoder,
+                sub_decoder,
+                batch,
+                encoder_optim,
+                sub_encoder_optim,
+                sub_decoder_optim,
+                device,
+            )
             if step % TRAIN_LOG_FREQ == 0:
                 for key, val in train_statistics.items():
                     neptune.log_metric(f"train/{key}", step, val)
 
             if step % EVAL_LOG_FREQ == 0:
                 with torch.no_grad():
-                    vali_statistics = evaluate(model, sub_model, vali_loader, loss_func, device)
+                    vali_statistics = evaluate(
+                        encoder, sub_encoder, sub_decoder, vali_loader, device
+                    )
 
                 for key, val in vali_statistics.items():
                     neptune.log_metric(f"vali/{key}", step, val)
