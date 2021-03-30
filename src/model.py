@@ -127,6 +127,43 @@ class SubGraphEncoder(NodeEncoder):
         return eps * std + mu
 
 
+class NewSubGraphDecoder(nn.Module):
+    def __init__(self, num_layers=5, emb_dim=1024):
+        super(NewSubGraphDecoder, self).__init__()
+        self.num_layers = num_layers
+
+        self.x_embedding1 = nn.Embedding(NUM_ATOM_TYPES, emb_dim)
+        self.x_embedding2 = nn.Embedding(NUM_CHIRALITY_TAGS, emb_dim)
+        self.z_embedding = torch.nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.BatchNorm1d(emb_dim),
+            nn.ReLU(),
+            nn.Linear(emb_dim, emb_dim),
+            )
+            
+        nn.init.xavier_uniform_(self.x_embedding1.weight.data)
+        nn.init.xavier_uniform_(self.x_embedding2.weight.data)
+
+        self.layers = nn.ModuleList([GINConv(emb_dim, aggr="add") for _ in range(num_layers)])
+        self.batch_norms = nn.ModuleList([nn.BatchNorm1d(emb_dim) for _ in range(num_layers - 1)])
+        self.classifier = nn.Linear(emb_dim, 1)
+        
+    def forward(self, z, x, edge_index, edge_attr, batch_num_nodes):
+        z_emb = self.z_embedding(z)
+        z_emb = torch.repeat_interleave(z_emb, batch_num_nodes, dim=0)
+        
+        out = self.x_embedding1(x[:, 0]) + self.x_embedding2(x[:, 1]) + z_emb
+        
+        for layer_idx in range(self.num_layers):
+            out = self.layers[layer_idx](out, edge_index, edge_attr)
+            if layer_idx < self.num_layers - 1:
+                out = self.batch_norms[layer_idx](out)
+                out = F.relu(out)
+                
+        out = self.classifier(out)
+
+        return out
+
 class SubGraphDecoder(nn.Module):
     def __init__(self, num_layers=5, emb_dim=1024):
         super(SubGraphDecoder, self).__init__()

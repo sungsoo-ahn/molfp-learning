@@ -90,22 +90,95 @@ class SubBatch(Data):
 
 
 class SubDataLoader(DataLoader):
-    r"""Data loader which merges data objects from a
-    :class:`torch_geometric.data.dataset` to a mini-batch.
-    Args:
-        dataset (Dataset): The dataset from which to load the data.
-        batch_size (int, optional): How may samples per batch to load.
-            (default: :obj:`1`)
-        shuffle (bool, optional): If set to :obj:`True`, the data will be
-            reshuffled at every epoch (default: :obj:`True`)
-    """
-
     def __init__(self, dataset, batch_size, shuffle, compute_true_target, **kwargs):
         super(SubDataLoader, self).__init__(
             dataset,
             batch_size,
             shuffle,
             collate_fn=lambda data_list: SubBatch.from_data_list(
+                data_list, compute_true_target=compute_true_target
+            ),
+            **kwargs
+        )
+
+
+class SearchBatch(Data):
+    def __init__(self, batch=None, **kwargs):
+        super(SearchBatch, self).__init__(**kwargs)
+        self.batch = batch
+
+    @staticmethod
+    def from_data_list(data_list, compute_true_target):
+        keys = [set(data.keys) for data in data_list]
+        keys = list(set.union(*keys))
+        assert "batch" not in keys
+
+        batch = SearchBatch()
+        for key in keys:
+            batch[key] = []
+
+        batch.batch = []
+        batch.batch_num_nodes = []
+        batch.batch_num_edges = []
+        cumsum_node = 0
+
+        for i, data in enumerate(data_list):
+            num_nodes = data.num_nodes
+            num_edges = data.edge_attr.size(0)
+            batch.batch.append(torch.full((num_nodes,), i, dtype=torch.long))
+            batch.batch_num_nodes.append(num_nodes)
+            batch.batch_num_edges.append(num_edges)
+            
+            for key in data.keys:
+                item = data[key]
+                if key in ["edge_index"]:
+                    item = item + cumsum_node
+
+                batch[key].append(item)
+
+            cumsum_node += num_nodes
+
+        for key in keys:
+            if key in ["smiles"]:
+                continue
+
+            batch[key] = torch.cat(batch[key], dim=data_list[0].__cat_dim__(key, batch[key][0]))
+
+        batch.batch_size = len(data_list)
+        batch.batch = torch.cat(batch.batch, dim=-1)
+        batch.batch_num_nodes = torch.LongTensor(batch.batch_num_nodes)
+        batch.batch_num_edges = torch.LongTensor(batch.batch_num_edges)
+
+        return batch.contiguous()
+
+    def get_example(self, idx):
+        nodes_offset = torch.sum(self.batch_num_nodes[:idx]).item()
+        num_nodes = self.batch_num_nodes[idx].item()
+        edges_offset = torch.sum(self.batch_num_edges[:idx]).item()
+        num_edges = self.batch_num_edges[idx].item()
+        
+        x = self.x[nodes_offset:nodes_offset+num_nodes]
+        edge_index = self.edge_index[:, edges_offset:edges_offset+num_edges] - nodes_offset
+        edge_attr = self.edge_attr[edges_offset:edges_offset+num_edges]
+        smiles = self.smiles[idx]
+        
+        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, smiles=smiles)
+        
+        return data
+
+    @property
+    def num_graphs(self):
+        """Returns the number of graphs in the batch."""
+        return self.batch[-1].item() + 1
+
+
+class SearchDataLoader(DataLoader):
+    def __init__(self, dataset, batch_size, shuffle, compute_true_target, **kwargs):
+        super(SearchDataLoader, self).__init__(
+            dataset,
+            batch_size,
+            shuffle,
+            collate_fn=lambda data_list: SearchBatch.from_data_list(
                 data_list, compute_true_target=compute_true_target
             ),
             **kwargs

@@ -44,7 +44,12 @@ def compute_binary_statistics(logits, targets):
     acc = (tp + tn) / (tp + fp + fn + tn)
     precision = tp / (tp + fp)
     recall = tp / (tp + fn)
-
+    
+    if torch.isnan(precision).item():
+        precision = torch.zeros_like(precision)
+    if torch.isnan(recall).item():
+        recall = torch.zeros_like(recall)
+        
     return {
         "acc": acc,
         "precision": precision,
@@ -113,9 +118,9 @@ def train(
     for key, val in recon_binary_statistics.items():
         statistics[f"recon_{key}"] = val
 
-    recon_correct = ((recon_logits > 0) == (batch.sub_mask > 0.5)).float()
+    recon_correct = ((recon_logits.reshape(-1) > 0) == (batch.sub_mask.reshape(-1) > 0.5)).float()
     statistics[f"exact_recon_acc"] = -global_max_pool(-recon_correct, batch.batch).mean()
-
+    
     substruct_binary_statistics = compute_binary_statistics(substruct_logits, substruct_targets)
     for key, val in substruct_binary_statistics.items():
         statistics[f"substruct_{key}"] = val
