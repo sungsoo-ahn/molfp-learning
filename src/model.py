@@ -96,7 +96,7 @@ class NodeEncoder(nn.Module):
 
 
 class GraphEncoder(NodeEncoder):
-    def __init__(self, num_layers=5, emb_dim=1024):
+    def __init__(self, num_layers=5, emb_dim=256):
         super(GraphEncoder, self).__init__(num_layers, emb_dim)
 
     def forward(self, x, edge_index, edge_attr, batch):
@@ -107,7 +107,7 @@ class GraphEncoder(NodeEncoder):
 
 
 class SubGraphEncoder(NodeEncoder):
-    def __init__(self, num_layers=5, emb_dim=1024):
+    def __init__(self, num_layers=5, emb_dim=256):
         super(SubGraphEncoder, self).__init__(num_layers-1, emb_dim)
         self.last_mlp = nn.Linear(emb_dim, 2 * emb_dim)
         self.last_batch_norm = nn.BatchNorm1d(emb_dim)
@@ -128,7 +128,7 @@ class SubGraphEncoder(NodeEncoder):
 
 
 class NewSubGraphDecoder(nn.Module):
-    def __init__(self, num_layers=5, emb_dim=1024):
+    def __init__(self, num_layers=5, emb_dim=256):
         super(NewSubGraphDecoder, self).__init__()
         self.num_layers = num_layers
 
@@ -165,7 +165,7 @@ class NewSubGraphDecoder(nn.Module):
         return out
 
 class SubGraphDecoder(nn.Module):
-    def __init__(self, num_layers=5, emb_dim=1024):
+    def __init__(self, num_layers=5, emb_dim=256):
         super(SubGraphDecoder, self).__init__()
         self.node_encoder = NodeEncoder(num_layers=num_layers, emb_dim=emb_dim)
         self.classifier = nn.Sequential(
