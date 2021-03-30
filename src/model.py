@@ -131,18 +131,22 @@ class SubGraphDecoder(nn.Module):
     def __init__(self, num_layers=5, emb_dim=1024):
         super(SubGraphDecoder, self).__init__()
         self.node_encoder = NodeEncoder(num_layers=num_layers, emb_dim=emb_dim)
-        self.projector = nn.Sequential(
-            nn.Linear(emb_dim, emb_dim),
-            nn.BatchNorm1d(emb_dim),
+        self.classifier = nn.Sequential(
+            nn.Linear(2*emb_dim, 2*emb_dim),
+            nn.BatchNorm1d(2*emb_dim),
             nn.ReLU(),
-            nn.Linear(emb_dim, emb_dim),
+            nn.Linear(2*emb_dim, 1),
         )
 
     def forward(self, z, x, edge_index, edge_attr, batch_num_nodes):
         out0 = self.node_encoder(x, edge_index, edge_attr)
-        out1 = self.projector(z)
-        out1 = torch.repeat_interleave(out1, batch_num_nodes, dim=0)
-        out = F.cosine_similarity(out0, out1, dim=1)
+        #out1 = self.projector(z)
+        #out1 = torch.repeat_interleave(out1, batch_num_nodes, dim=0)
+        #out = F.cosine_similarity(out0, out1, dim=1)
+        out1 = torch.repeat_interleave(z, batch_num_nodes, dim=0)
+        out = torch.cat([out0, out1], dim=1)
+        out = self.classifier(out)
+
         return out
 
 if __name__ == "__main__":

@@ -102,11 +102,12 @@ def train(
     sub_decoder_optim.step()
 
     loss = loss.detach()
+    recon_loss = recon_loss.detach()
     substruct_loss = substruct_loss.detach()
     kl_div_loss = kl_div_loss.detach()
     recon_logits = recon_logits.detach()
     substruct_logits = substruct_logits.detach()
-    statistics = {"loss": loss, "substruct_loss": substruct_loss, "kl_div_loss": kl_div_loss}
+    statistics = {"loss": loss, "kl_div_loss": kl_div_loss, "recon_loss": recon_loss, "substruct_loss": substruct_loss}
 
     recon_binary_statistics = compute_binary_statistics(recon_logits, batch.sub_mask)
     for key, val in recon_binary_statistics.items():
@@ -157,14 +158,14 @@ def evaluate(encoder, sub_encoder, sub_decoder, loader, device):
         loss = kl_div_loss + recon_loss + substruct_loss
 
         # Compute statistics
-        statistics = {"loss": loss, "substruct_loss": substruct_loss, "kl_div_loss": kl_div_loss}
+        statistics = {"loss": loss, "kl_div_loss": kl_div_loss, "recon_loss": recon_loss, "substruct_loss": substruct_loss}
 
         recon_binary_statistics = compute_binary_statistics(recon_logits, batch.sub_mask)
         for key, val in recon_binary_statistics.items():
             statistics[f"recon_{key}"] = val
 
         recon_correct = ((recon_logits > 0) == (batch.sub_mask > 0.5)).float()
-        statistics[f"exact_recon_acc"] = global_mean_pool(recon_correct, batch.batch).mean()
+        statistics[f"exact_recon_acc"] = -global_max_pool(-recon_correct, batch.batch).mean()
 
         substruct_binary_statistics = compute_binary_statistics(substruct_logits, substruct_targets)
         for key, val in substruct_binary_statistics.items():
@@ -208,6 +209,7 @@ def main():
     TRAIN_LOG_FREQ = 10
     EVAL_LOG_FREQ = 5000
     DATASET_DIR = "../resource/dataset/"
+    RESULT_DIR = "../resource/result/"
     DATASET = "zinc_standard_agent"
     NUM_EPOCHS = 200
 
@@ -216,7 +218,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--min_walk_length", type=int, default=2)
     parser.add_argument("--max_walk_length", type=int, default=10)
-    parser.add_argument("--loss_scheme", type=str, default="ce")
+
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -301,6 +303,9 @@ def main():
                 for key, val in vali_statistics.items():
                     neptune.log_metric(f"vali/{key}", step, val)
 
+        torch.save(encoder.state_dict(), f"{RESULT_DIR}encoder.pt")
+        torch.save(sub_encoder.state_dict(), f"{RESULT_DIR}sub_encoder.pt")
+        torch.save(sub_decoder.state_dict(), f"{RESULT_DIR}sub_decoder.pt")
 
 if __name__ == "__main__":
     main()
