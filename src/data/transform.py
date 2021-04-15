@@ -50,6 +50,7 @@ class AddRandomWalkSubStruct(AddSubStruct):
             torch.tensor([root_node]), 
             walk_length=walk_length
         ).squeeze(0)
+        
         inducing_nodes = torch.unique(randomwalk_nodes).tolist()
         induced_nx_graph = nx_graph.subgraph(inducing_nodes)
         induced_nx_graph = reset_idxes(induced_nx_graph)
